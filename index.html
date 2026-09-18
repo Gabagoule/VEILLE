@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Veille Reacoeur</title>
+<title>Veille URCV</title>
 <meta name="theme-color" content="#F2F2F5" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -231,6 +231,8 @@ button.chip:hover { border-color: var(--ink3); }
 .pill.new { background: var(--amber-soft); color: var(--amber); }
 .pill.retracted { background: var(--red); color: #fff; }
 .pill.preprint { background: var(--sunk); color: var(--ink2); }
+.pill.aff { background: var(--blue-soft); color: var(--blue); }
+.pill.pick { background: var(--violet); color: #fff; }
 
 .score {
   display: inline-grid; place-items: center; min-width: 38px; height: 26px; padding: 0 8px;
@@ -381,6 +383,15 @@ kbd { font-family: var(--font); font-size: 11px; padding: 1px 6px; border-radius
 .node .nb text { fill: #fff; stroke: none; font-size: 10.5px; font-weight: 700; }
 .node .initial { fill: #fff; stroke: none; font-size: 13px; }
 .node.folder .initial { fill: var(--ink2); }
+.node.neg .core { opacity: .45; stroke-dasharray: 5 4; }
+.node.weak .core { opacity: .7; }
+.map-empty { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; padding: 24px; }
+.map-empty > div { pointer-events: auto; max-width: 420px; text-align: center; background: var(--card); border: 1px solid var(--line);
+  border-radius: 18px; box-shadow: var(--shadow-2); padding: 22px 24px; }
+.map-empty h3 { font-family: var(--font-display); font-size: 18px; margin: 0 0 6px; }
+.map-empty p { color: var(--ink2); margin: 0 0 12px; font-size: 13.5px; }
+.wbar { height: 8px; border-radius: 4px; background: var(--sunk); overflow: hidden; display: flex; }
+.wbar i { display: block; height: 100%; }
 .node .pulse { fill: none; stroke: var(--red); stroke-width: 2; opacity: 0; transform-box: fill-box; transform-origin: center; }
 .node.scanning .pulse { animation: pulse 1.2s ease-out infinite; }
 @keyframes pulse { 0% { opacity: .9; transform: scale(1); } 100% { opacity: 0; transform: scale(1.9); } }
@@ -562,7 +573,10 @@ input[type=range] { width: 100%; accent-color: var(--red); }
 
   .triage { padding: 10px 12px 10px; gap: 8px; }
   .triage-bar .left { display: none; }
-  .triage-bar select { flex: 1; min-width: 0; }
+  .triage-bar { gap: 6px; }
+  .triage-bar select { flex: 1 1 92px; min-width: 0; }
+  .triage-bar .seg button { padding: 4px 8px; font-size: 12px; }
+  #trProgress { padding: 4px 8px; font-size: 12px; }
   .card { padding: 18px 18px 14px; border-radius: 22px; }
   .card h2 { font-size: 18.5px; margin: 6px 0 4px; }
   .card .authors { margin-bottom: 8px; font-size: 12px; }
@@ -818,10 +832,14 @@ const DEFAULT_SETTINGS = {
   half_life_days: 180,
   context_query: DEFAULT_CONTEXT,
   context_enabled: true,
-  weights: { evidence: 30, velocity: 25, freshness: 25, journal: 10, theme: 10 },
+  weights: { evidence: 30, velocity: 25, freshness: 25, journal: 10, theme: 10, affinity: 20 },
   auto_scan_enabled: false,
   auto_scan_hours: 20,
   metrics_refresh_days: 7,
+  session_size: 20,
+  session_cooldown_h: 2,
+  session_model_picks: 5,
+  model_min_labels: 60,
   saved_views: [],
   u: 0,
 };
@@ -852,8 +870,9 @@ const DB = {
   scans: {},             // themeId -> {last, hash, n, u}
   sources: {},           // id journal OpenAlex -> {name, impact, h, t}
   events: [],            // [{id, ts, k, p}]
+  session: { n: 0, started: 0, ended: 0, u: 0 },   // session de triage en cours
 };
-const CORE_KEYS = ["themes", "exclusions", "settings", "states", "scans", "sources", "events"];
+const CORE_KEYS = ["themes", "exclusions", "settings", "states", "scans", "sources", "events", "session"];
 
 async function loadDB() {
   await IDB.open();
@@ -861,6 +880,7 @@ async function loadDB() {
   articles.forEach(a => DB.articles.set(a.pmid, a));
   CORE_KEYS.forEach((k, i) => { if (docs[i] !== undefined) DB[k] = docs[i]; });
   DB.settings = { ...DEFAULT_SETTINGS, ...DB.settings, weights: { ...DEFAULT_SETTINGS.weights, ...(DB.settings.weights || {}) } };
+  DB.session = { n: 0, started: 0, ended: 0, u: 0, ...DB.session };
   if (!Object.keys(DB.themes).length && !localStorage.getItem("veille.seeded")) {
     SEED_THEMES.forEach(t => DB.themes[t.id] = structuredClone(t));
     SEED_EXCLUSIONS.forEach(e => DB.exclusions[e.id] = structuredClone(e));
@@ -973,7 +993,6 @@ function evidenceGroup(types) {
 function computeScore(a, st) {
   const s = DB.settings;
   const w = s.weights;
-  const total = Object.values(w).reduce((x, y) => x + Math.max(0, +y), 0) || 1;
   const half = Math.max(7, +s.half_life_days || 180);
   const vel = velocity(a);
   const themeW = Math.max(0, ...liveThemeIds(a).map(id => DB.themes[id].weight || 3));
@@ -985,7 +1004,13 @@ function computeScore(a, st) {
     journal: Math.min(1, Math.log1p(impact) / Math.log1p(20)),
     theme: Math.min(1, themeW / 5),
   };
-  let score = Object.keys(comps).reduce((acc, k) => acc + comps[k] * Math.max(0, +w[k] || 0), 0) / total * 100;
+  // L'affinité n'entre dans le score que lorsque le modèle est entraîné :
+  // tant qu'il ne l'est pas, son poids est retiré du total au lieu de diluer le reste.
+  const aff = affinity(a);
+  if (aff !== null) comps.affinity = aff;
+  let total = 0, sum = 0;
+  for (const k of Object.keys(comps)) { const ww = Math.max(0, +w[k] || 0); total += ww; sum += comps[k] * ww; }
+  let score = sum / (total || 1) * 100;
   if (a.ret) score *= 0.1;
   if (st.d) score *= 0.6;
   return { score: Math.round(score * 10) / 10, comps, vel, impact: impact || null };
@@ -1025,6 +1050,7 @@ function haystack(a) {
 const SORTS = {
   score: v => v.score, date: v => v.a.date || "", citations: v => v.cites, velocity: v => v.vel,
   rcr: v => v.a.rcr || 0, journal: v => v.impact || 0, added: v => v.a.fs || 0, changed: v => v.st.t || 0,
+  affinity: v => v.comps.affinity ?? 0,
 };
 
 /** Filtrage + tri en mémoire. */
@@ -1092,6 +1118,189 @@ function themeCounts() {
     }
   }
   return out;
+}
+
+
+/* =====================================================================
+   3 bis. Modèle d'affinité et carte des concepts
+   Régression logistique entraînée dans le navigateur sur les swipes.
+   La carte des thèmes appris n'est rien d'autre que l'affichage des
+   traits de ce modèle : un point par concept, taille = nombre
+   d'articles validés, couleur = poids appris.
+   ===================================================================== */
+const STOPWORDS = new Set(("the of and in for with a an to on by from as at is are was were be been that this these those it its" +
+  " we our their effect effects study trial patients patient outcome outcomes results result after before during versus" +
+  " between among associated association risk analysis review using use based data cohort retrospective prospective" +
+  " single multicenter center centre case series report reports randomized randomised controlled clinical care unit new" +
+  " impact role comparison evaluation assessment management therapy treatment").split(" "));
+const FEATURE_KINDS = { mesh: "MeSH", kw: "Mot-clé", type: "Type d'étude", jr: "Journal", ti: "Terme du titre" };
+const MAP_KINDS = ["mesh", "kw", "type", "jr"];
+const POSITIVE_STATUS = new Set(["toread", "read", "club", "archive"]);
+const CONCEPT_MIN_SUPPORT = 2;   // deux validations avant d'apparaître sur la carte
+
+/** Traits binaires d'un article : concepts (MeSH, mots-clés, type, journal) et mots du titre. */
+function featuresOf(a) {
+  const out = new Set();
+  (a.mesh || []).slice(0, 25).forEach(m => { const t = m.toLowerCase().trim(); if (t) out.add("mesh:" + t); });
+  (a.kw || []).slice(0, 15).forEach(k => { const t = k.toLowerCase().trim(); if (t && t.length > 2) out.add("kw:" + t); });
+  (a.types || []).forEach(t => { if (t !== "Journal Article" && t !== "English Abstract") out.add("type:" + t.toLowerCase()); });
+  const jr = (a.ja || a.journal || "").toLowerCase().trim();
+  if (jr) out.add("jr:" + jr);
+  (a.title || "").toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/)
+    .filter(w => w.length > 3 && !STOPWORDS.has(w)).slice(0, 20).forEach(w => out.add("ti:" + w));
+  return [...out];
+}
+
+/** Étiquette tirée du triage. Gardé = positif, ignoré = négatif faible, « moins de ça » = négatif fort. */
+function labelOf(st) {
+  if (!st || !st.t) return null;                       // jamais trié
+  if (st.f || POSITIVE_STATUS.has(st.s)) return { y: 1, w: st.f ? 1.6 : 1 };
+  if (st.s === "ignored") return { y: 0, w: st.d ? 2.5 : 0.6 };
+  return null;                                          // resté dans l'inbox
+}
+
+const MODEL = { ready: false, w: new Map(), b: 0, n: 0, pos: 0, neg: 0, dis: 0, acc: null,
+  concepts: [], byKey: new Map(), edges: [], version: 0, trainedAt: 0 };
+const affCache = new Map();
+
+function sigmoid(z) { return 1 / (1 + Math.exp(-z)); }
+
+/** Probabilité que l'article soit gardé, ou null tant que le modèle n'est pas prêt. */
+function affinity(a) {
+  if (!MODEL.ready) return null;
+  let v = affCache.get(a.pmid);
+  if (v === undefined) {
+    let z = MODEL.b;
+    for (const f of featuresOf(a)) z += MODEL.w.get(f) || 0;
+    v = sigmoid(z);
+    affCache.set(a.pmid, v);
+  }
+  return v;
+}
+
+/** Descente de gradient sur les traits présents, avec rééquilibrage des deux classes. */
+function fitLogistic(data) {
+  const w = new Map();
+  let b = 0;
+  const nPos = data.reduce((n, e) => n + (e.y === 1 ? 1 : 0), 0);
+  const cw = { 1: data.length / (2 * Math.max(1, nPos)), 0: data.length / (2 * Math.max(1, data.length - nPos)) };
+  const lr = 0.2, l2 = 0.004, epochs = 90;
+  for (let ep = 0; ep < epochs; ep++) {
+    for (const e of data) {
+      let z = b;
+      for (const f of e.fi) z += w.get(f) || 0;
+      const g = (e.y - sigmoid(z)) * e.sw * cw[e.y] * lr;
+      b += g;
+      for (const f of e.fi) w.set(f, (w.get(f) || 0) * (1 - lr * l2) + g);
+    }
+  }
+  return { w, b };
+}
+
+function trainModel() {
+  const ex = [];
+  for (const a of DB.articles.values()) {
+    const lab = labelOf(DB.states[a.pmid]);
+    if (!lab) continue;
+    ex.push({ pmid: a.pmid, t: DB.states[a.pmid].t, f: featuresOf(a), y: lab.y, sw: lab.w });
+  }
+  // Les 3000 décisions les plus récentes suffisent, et l'ordre est fixe :
+  // deux appareils avec les mêmes swipes obtiennent exactement le même modèle.
+  ex.sort((x, y) => y.t - x.t);
+  ex.length = Math.min(ex.length, 3000);
+  ex.sort((x, y) => (x.pmid < y.pmid ? -1 : 1));
+
+  MODEL.n = ex.length;
+  MODEL.pos = ex.filter(e => e.y === 1).length;
+  MODEL.neg = ex.length - MODEL.pos;
+  MODEL.dis = ex.filter(e => e.y === 0 && e.sw >= 2).length;
+  MODEL.trainedAt = Date.now();
+  MODEL.version++;
+  affCache.clear();
+  buildConcepts(ex);
+
+  const min = Math.max(20, +DB.settings.model_min_labels || 60);
+  MODEL.ready = ex.length >= min && MODEL.pos >= 10 && MODEL.neg >= 10;
+  if (!MODEL.ready) { MODEL.w = new Map(); MODEL.b = 0; MODEL.acc = null; attachWeights(); return; }
+
+  // Vocabulaire : traits vus au moins deux fois, pour ne pas apprendre par cœur
+  const df = new Map();
+  ex.forEach(e => e.f.forEach(f => df.set(f, (df.get(f) || 0) + 1)));
+  const vocab = new Set([...df].filter(([, c]) => c >= 2).map(([f]) => f));
+  ex.forEach(e => e.fi = e.f.filter(f => vocab.has(f)));
+
+  // Découpage entraînement / test déterministe, pour mesurer la justesse
+  const isTest = (e) => parseInt(e.pmid.slice(-2), 10) % 5 === 0;
+  const train = ex.filter(e => !isTest(e)), test = ex.filter(isTest);
+  MODEL.acc = null;
+  if (train.length >= 30 && test.length >= 10 && test.some(e => e.y === 1) && test.some(e => e.y === 0)) {
+    const probe = fitLogistic(train);
+    let ok = 0;
+    for (const e of test) {
+      let z = probe.b;
+      for (const f of e.fi) z += probe.w.get(f) || 0;
+      if ((z >= 0 ? 1 : 0) === e.y) ok++;
+    }
+    MODEL.acc = ok / test.length;
+  }
+  const full = fitLogistic(ex);
+  MODEL.w = full.w; MODEL.b = full.b;
+  MODEL.version++;
+  affCache.clear();
+  attachWeights();
+}
+
+/** Un concept naît d'un article validé ; un article ignoré ne peut que faire maigrir un concept existant. */
+function buildConcepts(ex) {
+  const stat = new Map();
+  for (const e of ex) {
+    for (const f of e.f) {
+      const i = f.indexOf(":");
+      const kind = f.slice(0, i);
+      if (!MAP_KINDS.includes(kind)) continue;
+      let c = stat.get(f);
+      if (!c) {
+        if (e.y !== 1) continue;                       // pas de création par un swipe « ignoré »
+        stat.set(f, c = { key: f, kind, label: f.slice(i + 1), pos: 0, neg: 0, dis: 0, w: 0, pmids: [] });
+      }
+      if (e.y === 1) { c.pos++; if (c.pmids.length < 60) c.pmids.push(e.pmid); }
+      else { c.neg++; if (e.sw >= 2) c.dis++; }
+    }
+  }
+  MODEL.concepts = [...stat.values()].filter(c => c.pos >= CONCEPT_MIN_SUPPORT)
+    .sort((a, b) => b.pos - a.pos || a.label.localeCompare(b.label));
+  MODEL.byKey = new Map(MODEL.concepts.map(c => [c.key, c]));
+  buildEdges(ex);
+}
+
+/** Arêtes : deux concepts reliés quand ils apparaissent ensemble dans des articles validés. */
+function buildEdges(ex) {
+  const keep = MODEL.byKey;
+  const pairs = new Map();
+  for (const e of ex) {
+    if (e.y !== 1) continue;
+    const fs = e.f.filter(f => keep.has(f)).sort();
+    for (let i = 0; i < fs.length; i++)
+      for (let j = i + 1; j < fs.length; j++) {
+        const k = fs[i] + "|" + fs[j];
+        pairs.set(k, (pairs.get(k) || 0) + 1);
+      }
+  }
+  MODEL.edges = [...pairs].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 400)
+    .map(([k, n]) => { const [a, b] = k.split("|"); return { a, b, n }; });
+}
+
+function attachWeights() { MODEL.concepts.forEach(c => c.w = MODEL.w.get(c.key) || 0); }
+
+const retrainSoon = debounce(() => { trainModel(); if (state.view === "graph" && graph.mode === "interests") drawGraph(); }, 1500);
+
+/** Concepts d'un article, tels qu'ils figurent sur la carte. */
+function conceptsOf(a) { return featuresOf(a).map(f => MODEL.byKey.get(f)).filter(Boolean); }
+
+function modelStatus() {
+  if (MODEL.ready) return `Affinité active${MODEL.acc != null ? `, ${Math.round(MODEL.acc * 100)} % de justesse` : ""}`;
+  const min = Math.max(20, +DB.settings.model_min_labels || 60);
+  return `Modèle : ${MODEL.n} / ${min} décisions`;
 }
 
 /* =====================================================================
@@ -1589,6 +1798,9 @@ async function applyCore(remote) {
     DB.settings = { ...DEFAULT_SETTINGS, ...rs, weights: { ...DEFAULT_SETTINGS.weights, ...(rs.weights || {}) } };
     changed = true; pendingDocs.add("settings");
   } else if ((DB.settings.u || 0) > (rs.u || 0)) ahead = true;
+  const rsess = remote.session;
+  if (rsess && (rsess.u || 0) > (DB.session.u || 0)) { DB.session = rsess; changed = true; pendingDocs.add("session"); }
+  else if ((DB.session.u || 0) > (rsess?.u || 0)) ahead = true;
   const ids = new Set(DB.events.map(e => e.id));
   const incoming = (remote.events || []).filter(e => !ids.has(e.id));
   if (incoming.length) { DB.events = [...DB.events, ...incoming].sort((a, b) => a.ts - b.ts); changed = true; pendingDocs.add("events"); }
@@ -1686,6 +1898,7 @@ async function syncNow({ quiet = false } = {}) {
 }
 
 function refreshAfterSync() {
+  trainModel();
   refreshStats();
   const typing = document.activeElement?.matches("input, textarea, select");
   if (state.view === "triage") reloadTriage({ keepTop: true });
@@ -1886,7 +2099,73 @@ function themeOptions(selected, excludeId) {
 /* =====================================================================
    9. Vue TRIAGE : paquet de cartes à glisser
    ===================================================================== */
-const triage = { queue: [], undo: [], theme: "", sort: "score" };
+const triage = { queue: [], picks: new Set(), undo: [], theme: "", sort: "score", session: [], baseline: new Set() };
+let countdownTimer = null;
+
+const sessionCfg = () => ({
+  size: Math.max(5, +DB.settings.session_size || 20),
+  cooldown: Math.max(0, +DB.settings.session_cooldown_h || 2) * 3600e3,
+  picks: Math.max(0, +DB.settings.session_model_picks || 0),
+});
+const sessionDone = () => DB.session?.n || 0;
+function sessionPhase() {
+  const { size, cooldown } = sessionCfg();
+  const s = DB.session || {};
+  if (s.ended && Date.now() - s.ended < cooldown) return "pause";
+  if (!s.ended && sessionDone() >= size) return "pause";
+  return s.ended ? "ready" : "active";
+}
+function setSession(patch) { DB.session = { ...DB.session, ...patch, u: Date.now() }; touch("session"); }
+
+/** Nouvelle session : remet le compteur à zéro et compose un nouveau paquet. */
+function startSession() {
+  setSession({ n: 0, started: Date.now(), ended: 0 });
+  triage.session = [];
+  triage.baseline = new Set(MODEL.concepts.map(c => c.key));
+  buildQueue();
+  renderDeck();
+}
+
+/**
+ * Compose le paquet de la session : quelques cartes choisies par le modèle,
+ * le reste selon le tri courant, les deux entremêlés.
+ */
+function buildQueue() {
+  const { size, picks } = sessionCfg();
+  const remaining = Math.max(0, size - sessionDone());
+  const base = queryArticles({ status: ["inbox"], sort: triage.sort, themes: triage.theme ? [triage.theme] : [] });
+  triage.picks = new Set();
+  const chosen = [], seen = new Set();
+  const wanted = Math.min(picks, Math.max(0, remaining - 1));
+  if (MODEL.ready && wanted) {
+    for (const v of base.slice().sort((x, y) => (affinity(y.a) || 0) - (affinity(x.a) || 0))) {
+      if (triage.picks.size >= wanted) break;
+      seen.add(v.a.pmid);
+      triage.picks.add(v.a.pmid);
+    }
+  }
+  for (const v of base) {
+    if (chosen.length >= remaining - triage.picks.size) break;
+    if (seen.has(v.a.pmid)) continue;
+    chosen.push(v.a.pmid);
+  }
+  // Les cartes du modèle sont réparties dans le paquet plutôt que groupées en tête
+  const modelPicks = [...triage.picks];
+  const out = [];
+  const step = modelPicks.length ? Math.max(2, Math.floor(remaining / (modelPicks.length + 1))) : 0;
+  let mi = 0;
+  chosen.forEach((pmid, i) => {
+    out.push(pmid);
+    if (mi < modelPicks.length && (i + 1) % step === 0) out.push(modelPicks[mi++]);
+  });
+  while (mi < modelPicks.length) out.push(modelPicks[mi++]);
+  triage.queue = out.slice(0, remaining);
+}
+
+function fmtLeft(ms) {
+  const m = Math.max(0, Math.ceil(ms / 60000));
+  return m >= 60 ? `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")}` : `${m} min`;
+}
 
 RENDER.triage = function () {
   const root = $("#view-triage");
@@ -1901,6 +2180,7 @@ RENDER.triage = function () {
           <button data-v="date" class="${triage.sort === "date" ? "on" : ""}">Récents</button>
           <button data-v="velocity" class="${triage.sort === "velocity" ? "on" : ""}">Tendance</button>
         </div>
+        <span class="chip" id="trProgress" title="Avancement de la session"></span>
         <span class="left" id="trLeft"></span>
       </div>
       <div class="deck" id="deck"></div>
@@ -1928,8 +2208,7 @@ RENDER.triage = function () {
 
 function reloadTriage({ keepTop = false } = {}) {
   const top = triage.queue[0];
-  const f = { status: ["inbox"], sort: triage.sort, themes: triage.theme ? [triage.theme] : [] };
-  triage.queue = queryArticles(f).map(v => v.a.pmid);
+  buildQueue();
   // La carte affichée reste en tête : pas de saut sous les doigts pendant une synchro
   const i = keepTop && top ? triage.queue.indexOf(top) : -1;
   if (i > 0) { triage.queue.splice(i, 1); triage.queue.unshift(top); }
@@ -1942,9 +2221,15 @@ function pruneTriage() {
 function renderDeck() {
   const deck = $("#deck");
   if (!deck) return;
-  const n = triage.queue.length;
-  $("#trLeft").textContent = n ? `${plural(n, "article", "articles")} à trier` : "";
+  clearInterval(countdownTimer);
+  const { size } = sessionCfg();
+  const prog = $("#trProgress");
+  if (prog) prog.textContent = `${Math.min(sessionDone(), size)} / ${size}`;
+  const left = $("#trLeft");
+  if (left) left.textContent = modelStatus();
   deck.innerHTML = "";
+  if (sessionPhase() !== "active") { renderPause(deck); return; }
+  const n = triage.queue.length;
   if (!n) {
     const neverScanned = !Object.keys(DB.scans).length;
     deck.innerHTML = `<div class="empty" style="height:100%"><div>
@@ -1968,6 +2253,45 @@ function renderDeck() {
   });
 }
 
+/** Fin de session : bilan, concepts qui ont bougé, compte à rebours. */
+function renderPause(deck) {
+  const { cooldown } = sessionCfg();
+  const s = DB.session || {};
+  const wait = s.ended ? s.ended + cooldown - Date.now() : 0;
+  const kept = triage.session.filter(p => { const st = stateOf(p); return st.f || POSITIVE_STATUS.has(st.s); }).length;
+
+  // Concepts renforcés pendant la session, sinon les plus solides de la carte
+  const grown = new Map();
+  triage.session.forEach(pmid => {
+    const a = DB.articles.get(pmid);
+    if (a) conceptsOf(a).forEach(c => grown.set(c.key, (grown.get(c.key) || 0) + 1));
+  });
+  const top = grown.size
+    ? [...grown].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k]) => MODEL.byKey.get(k)).filter(Boolean)
+    : MODEL.concepts.filter(c => c.w > 0).slice(0, 6);
+  const chips = top.map(c => `<span class="chip">${triage.baseline.size && !triage.baseline.has(c.key) ? `<span class="pill new">nouveau</span>` : ""}${esc(c.label)}<span class="hint">${c.pos}</span></span>`);
+
+  deck.innerHTML = `<div class="empty" style="height:100%"><div>
+    <h3>${wait > 0 ? "Session terminée" : "Prêt pour une session"}</h3>
+    <p>${triage.session.length
+      ? `${plural(triage.session.length, "carte triée", "cartes triées")}, dont ${plural(kept, "gardée", "gardées")}.`
+      : "Le triage se fait par sessions courtes : un paquet, une pause, puis un paquet affiné par le modèle."}
+      ${wait > 0 ? `<br>Prochaine session dans <b id="cdown">${fmtLeft(wait)}</b>.` : ""}</p>
+    ${chips.length ? `<div class="chips" style="justify-content:center;max-width:520px;margin:0 auto 16px">${chips.join("")}</div>` : ""}
+    <button class="btn ghost" id="pauseMap">${icon("graph")}Voir la carte d'intérêts</button>
+    <button class="btn ${wait > 0 ? "plain" : ""}" id="pauseNow">${wait > 0 ? "Reprendre maintenant" : "Lancer la session"}</button>
+  </div></div>`;
+  $("#pauseMap").onclick = () => { graph.mode = "interests"; go("graph"); };
+  $("#pauseNow").onclick = () => startSession();
+  if (wait > 0) countdownTimer = setInterval(() => {
+    const box = $("#cdown");
+    if (!box) return clearInterval(countdownTimer);
+    const ms = s.ended + cooldown - Date.now();
+    if (ms <= 0) { clearInterval(countdownTimer); renderDeck(); return; }
+    box.textContent = fmtLeft(ms);
+  }, 20000);
+}
+
 function buildCard(v) {
   const a = v.a;
   const card = el(`
@@ -1982,7 +2306,7 @@ function buildCard(v) {
       </div>
       <h2>${esc(a.title)}</h2>
       <div class="authors">${esc(authorsShort(a.authors))}</div>
-      <div class="row">${badgesHtml(v)}</div>
+      <div class="row">${v.comps.affinity != null ? `<span class="pill aff">Affinité ${Math.round(v.comps.affinity * 100)}</span>` : ""}${triage.picks.has(a.pmid) ? `<span class="pill pick">Choisi par le modèle</span>` : ""}${badgesHtml(v)}</div>
       ${metricsHtml(v)}
       <div class="abstract">${abstractHtml(a.abstract)}</div>
       <div class="card-foot">
@@ -2066,10 +2390,17 @@ async function commitSwipe(dir, from) {
   const prev = setState(pmid, cfg.patch, cfg.event);
   triage.undo.push({ pmid, prev });
   if (triage.undo.length > 30) triage.undo.shift();
+  triage.session.push(pmid);
   triage.queue.shift();
+  const { size } = sessionCfg();
+  const n = sessionDone() + 1;
+  const over = n >= size || !triage.queue.length;
+  setSession(over ? { n, ended: Date.now() } : { n });
+  if (over) trainModel();          // le bilan de session montre la carte à jour
+  else retrainSoon();
   renderDeck();
   swipeLock = false;
-  toast(cfg.msg, { action: { label: "Annuler", fn: undoSwipe }, timeout: 2600 });
+  if (!over) toast(cfg.msg, { action: { label: "Annuler", fn: undoSwipe }, timeout: 2600 });
   refreshStatsSoon();
 }
 
@@ -2078,7 +2409,10 @@ function undoSwipe() {
   if (!last) return toast("Rien à annuler.");
   DB.states[last.pmid] = { ...last.prev, t: Date.now() };
   touch("states");
+  if (triage.session.at(-1) === last.pmid) triage.session.pop();
+  setSession({ n: Math.max(0, sessionDone() - 1), ended: 0 });
   triage.queue.unshift(last.pmid);
+  retrainSoon();
   renderDeck();
   refreshStatsSoon();
 }
@@ -2097,13 +2431,37 @@ document.addEventListener("keydown", (e) => {
 /* =====================================================================
    10. Vue THÈMES : graphe interactif + inspecteur
    ===================================================================== */
-const graph = { k: 1, tx: 0, ty: 0, selected: null, centered: false, counts: {} };
+const graph = { k: 1, tx: 0, ty: 0, selected: null, centered: false, counts: {}, mode: "themes" };
+const MAP = { pos: new Map(), version: -1, selected: null, kinds: new Set(["mesh", "kw"]) };
+
+const gModeHtml = () => `<div class="seg" id="gMode">
+  <button data-m="themes" class="${graph.mode === "themes" ? "on" : ""}">Recherche</button>
+  <button data-m="interests" class="${graph.mode === "interests" ? "on" : ""}">Intérêts</button>
+</div>`;
+function bindGMode() {
+  $$("#gMode button").forEach(b => b.onclick = () => {
+    if (graph.mode === b.dataset.m) return;
+    graph.mode = b.dataset.m;
+    graph.selected = null; MAP.selected = null;
+    RENDER.graph();
+  });
+}
+function centerGraphOnce() {
+  if (graph.centered) return;
+  const r = $("#graph").getBoundingClientRect();
+  graph.tx = r.width / 2 - (isMobile() ? 0 : 160);
+  graph.ty = isMobile() ? r.height * 0.32 : r.height / 2;
+  graph.k = isMobile() ? 0.75 : 1;
+  graph.centered = true;
+}
 
 RENDER.graph = function () {
+  if (graph.mode === "interests") return renderInterestView();
   const root = $("#view-graph");
   root.innerHTML = `
     <div class="graph-wrap">
       <div class="gtools">
+        ${gModeHtml()}
         <button class="btn" id="gAdd" title="Nouveau thème">${icon("plus")}<span class="lbl-desk">Nouveau thème</span></button>
         <button class="btn ghost" id="gLayout" title="Réorganiser">${icon("spark")}<span class="lbl-desk">Réorganiser</span></button>
         <button class="btn ghost" id="gScanAll" title="Scanner tout">${icon("play")}<span class="lbl-desk">Scanner tout</span></button>
@@ -2115,14 +2473,9 @@ RENDER.graph = function () {
   $("#gAdd").onclick = () => newThemeModal();
   $("#gLayout").onclick = () => autoLayout();
   $("#gScanAll").onclick = () => startScan();
+  bindGMode();
   setupGraphInteractions();
-  if (!graph.centered) {
-    const r = $("#graph").getBoundingClientRect();
-    graph.tx = r.width / 2 - (isMobile() ? 0 : 160);
-    graph.ty = isMobile() ? r.height * 0.32 : r.height / 2;
-    graph.k = isMobile() ? 0.75 : 1;
-    graph.centered = true;
-  }
+  centerGraphOnce();
   const ts = themesList();
   const missing = ts.filter(t => t.x == null || t.y == null);
   missing.forEach((t, i) => {
@@ -2147,6 +2500,7 @@ function edgesHtml() {
 
 function drawGraph() {
   if (!$("#gNodes")) return;
+  if (graph.mode === "interests") return drawInterestMap();
   graph.counts = themeCounts();
   applyView();
   $("#gEdges").innerHTML = edgesHtml();
@@ -2204,7 +2558,11 @@ function setupGraphInteractions() {
     start = { x: e.clientX, y: e.clientY, tx: graph.tx, ty: graph.ty };
     moved = 0;
     const g = e.target.closest(".node");
-    if (g) {
+    if (g && graph.mode === "interests") {
+      mode = "pan";
+      start.tap = g.dataset.key;
+      svg.classList.add("panning");
+    } else if (g) {
       mode = "node";
       node = getTheme(g.dataset.id);
       const p = toGraph(e.clientX, e.clientY);
@@ -2248,6 +2606,8 @@ function setupGraphInteractions() {
     svg.classList.remove("panning");
     const m = mode; mode = null;
     if (m === "pan") {
+      if (moved < 6 && start.tap) { openConcept(start.tap); return; }
+      if (graph.mode === "interests") return;
       // double tap tactile dans le vide = nouveau thème
       if (moved < 6 && e.pointerType !== "mouse") {
         const now = Date.now();
@@ -2280,7 +2640,7 @@ function setupGraphInteractions() {
   }, { passive: false });
 
   svg.addEventListener("dblclick", (e) => {
-    if (e.target.closest(".node")) return;
+    if (e.target.closest(".node") || graph.mode === "interests") return;
     newThemeModal(toGraph(e.clientX, e.clientY));
   });
 }
@@ -2480,10 +2840,11 @@ function openInspector(id) {
   $("#iDel").onclick = () => deleteThemeModal(t);
 }
 
-function newThemeModal(pos) {
+function newThemeModal(pos, preset) {
   const body = el(`<div>
-    <div class="field"><label for="ntName">Nom du thème</label><input class="input" id="ntName" placeholder="ex. Vasoplégie"></div>
-    <div class="field"><label for="ntTerm">Terme de recherche en anglais</label><input class="input" id="ntTerm" placeholder="ex. vasoplegia (par défaut : le nom)">
+    ${preset ? `<p class="hint" style="margin:0 0 14px">Créé depuis la carte d'intérêts : ce concept revient dans les articles que tu gardes, mais rien ne le cherche pour l'instant.</p>` : ""}
+    <div class="field"><label for="ntName">Nom du thème</label><input class="input" id="ntName" placeholder="ex. Vasoplégie" value="${esc(preset?.name || "")}"></div>
+    <div class="field"><label for="ntTerm">Terme de recherche en anglais</label><input class="input" id="ntTerm" placeholder="ex. vasoplegia (par défaut : le nom)" value="${esc(preset?.term || "")}">
       <span class="hint">Tu pourras ajouter des synonymes et des termes MeSH ensuite.</span></div>
     <div class="field"><label for="ntParent">Rattaché à</label><select class="input" id="ntParent"><option value="">Aucun (racine)</option>${themeOptions(graph.selected || "")}</select></div>
     <div class="toggle-row"><span>Dossier<br><span class="hint">Regroupe d'autres thèmes sans être scanné lui-même</span></span><label class="switch"><input type="checkbox" id="ntFolder"><span></span></label></div>
@@ -2499,7 +2860,7 @@ function newThemeModal(pos) {
         const parent = $("#ntParent").value || null;
         const pt = getTheme(parent);
         const p = pos || (pt ? { x: pt.x + 110, y: pt.y + 80 } : { x: Math.random() * 60 - 30, y: Math.random() * 60 - 30 });
-        const t = { id: uid(), name, terms: $("#ntFolder").checked ? [] : [{ t: term, f: "auto" }], parent, weight: 3,
+        const t = { id: uid(), name, terms: $("#ntFolder").checked ? [] : [{ t: term, f: preset?.field || "auto" }], parent, weight: 3,
           color: pt?.color || "#0A6CFF", x: Math.round(p.x), y: Math.round(p.y), enabled: true, ctx: true, del: false };
         saveTheme(t);
         graph.selected = t.id;
@@ -2527,6 +2888,214 @@ function deleteThemeModal(t) {
       },
     }],
   });
+}
+
+
+/* =====================================================================
+   10 bis. Carte d'intérêts : les traits du modèle, en nœuds
+   Un point par concept issu des articles gardés. Taille = nombre de
+   validations, couleur = poids appris, liens = cooccurrences.
+   ===================================================================== */
+function renderInterestView() {
+  const root = $("#view-graph");
+  root.innerHTML = `
+    <div class="graph-wrap">
+      <div class="gtools">
+        ${gModeHtml()}
+        <div class="seg" id="gKinds">${MAP_KINDS.map(k => `<button data-k="${k}" class="${MAP.kinds.has(k) ? "on" : ""}">${FEATURE_KINDS[k]}</button>`).join("")}</div>
+        <button class="btn ghost" id="gRelayout" title="Réorganiser">${icon("spark")}<span class="lbl-desk">Réorganiser</span></button>
+      </div>
+      <svg id="graph"><g id="gView"><g id="gEdges"></g><g id="gNodes"></g></g></svg>
+      <div class="ghelp">Taille : articles gardés portant ce concept. Rouge : signal fort pour le modèle. Gris pointillé : concept devenu négatif.</div>
+      <div class="map-empty" id="mapEmpty" hidden></div>
+      <aside class="inspector" id="inspector" hidden></aside>
+    </div>`;
+  bindGMode();
+  $$("#gKinds button").forEach(b => b.onclick = () => {
+    MAP.kinds.has(b.dataset.k) ? MAP.kinds.delete(b.dataset.k) : MAP.kinds.add(b.dataset.k);
+    if (!MAP.kinds.size) MAP.kinds.add(b.dataset.k);
+    MAP.version = -1;
+    RENDER.graph();
+  });
+  $("#gRelayout").onclick = () => { MAP.version = -1; drawInterestMap(); };
+  setupGraphInteractions();
+  centerGraphOnce();
+  drawInterestMap();
+  if (MAP.selected && MODEL.byKey.has(MAP.selected)) openConcept(MAP.selected);
+}
+
+const conceptRadius = (c) => Math.min(46, 13 + Math.sqrt(c.pos) * 6);
+function conceptColor(c) {
+  if (c.w >= 0.45) return "var(--red)";
+  if (c.w >= 0.12) return "var(--violet)";
+  if (c.w > -0.12) return "var(--blue)";
+  return "var(--ink3)";
+}
+
+function visibleConcepts() {
+  return MODEL.concepts.filter(c => MAP.kinds.has(c.kind)).slice(0, 60);
+}
+
+/** Disposition par forces, amorcée par une empreinte du concept : stable d'un affichage à l'autre. */
+function layoutMap(nodes) {
+  if (MAP.version === MODEL.version && nodes.every(n => MAP.pos.has(n.key))) return;
+  const P = new Map();
+  nodes.forEach((n, i) => {
+    const h = parseInt(hashStr(n.key).slice(0, 5), 36) || i * 97;
+    const ang = (h % 628) / 100, rad = 110 + (h % 240);
+    P.set(n.key, { x: Math.cos(ang) * rad, y: Math.sin(ang) * rad, vx: 0, vy: 0, r: conceptRadius(n) });
+  });
+  const edges = MODEL.edges.filter(e => P.has(e.a) && P.has(e.b));
+  const arr = [...P.values()];
+  for (let it = 0; it < 140; it++) {
+    for (let i = 0; i < arr.length; i++) {
+      for (let j = i + 1; j < arr.length; j++) {
+        const a = arr[i], b = arr[j];
+        let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
+        if (d2 < 1) { dx = (i - j) * 0.7; dy = 0.9; d2 = 1; }
+        const d = Math.sqrt(d2);
+        const f = (16000 + (a.r + b.r) * 340) / d2;
+        a.vx += dx / d * f; a.vy += dy / d * f;
+        b.vx -= dx / d * f; b.vy -= dy / d * f;
+      }
+    }
+    for (const e of edges) {
+      const a = P.get(e.a), b = P.get(e.b);
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1;
+      const target = a.r + b.r + 120;
+      const f = (d - target) * 0.016 * Math.min(3, e.n);
+      a.vx += dx / d * f; a.vy += dy / d * f;
+      b.vx -= dx / d * f; b.vy -= dy / d * f;
+    }
+    const cool = 1 - it / 140;
+    for (const pt of arr) {
+      pt.vx -= pt.x * 0.009; pt.vy -= pt.y * 0.009;
+      pt.vx *= 0.58; pt.vy *= 0.58;
+      pt.x += Math.max(-26, Math.min(26, pt.vx)) * cool;
+      pt.y += Math.max(-26, Math.min(26, pt.vy)) * cool;
+    }
+  }
+  // Dernière passe : on écarte les paires qui se touchent encore, étiquette comprise
+  for (let pass = 0; pass < 80; pass++) {
+    let moved = false;
+    for (let i = 0; i < arr.length; i++) {
+      for (let j = i + 1; j < arr.length; j++) {
+        const a = arr[i], c = arr[j];
+        const need = a.r + c.r + 70;
+        let dx = c.x - a.x, dy = (c.y - a.y) * 0.8;      // l'étiquette occupe le dessous du nœud
+        const d = Math.hypot(dx, dy) || 1;
+        if (d >= need) continue;
+        const push = (need - d) / 2;
+        a.x -= dx / d * push; a.y -= dy / d * push;
+        c.x += dx / d * push; c.y += dy / d * push;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  MAP.pos = new Map([...P].map(([k, v]) => [k, { x: Math.round(v.x), y: Math.round(v.y) }]));
+  MAP.version = MODEL.version;
+}
+
+function drawInterestMap() {
+  if (!$("#gNodes")) return;
+  applyView();
+  const nodes = visibleConcepts();
+  const box = $("#mapEmpty");
+  if (box) {
+    box.hidden = nodes.length > 0;
+    if (!nodes.length) {
+      box.innerHTML = `<div><h3>La carte se dessine en triant</h3>
+        <p>Chaque article gardé dépose ses concepts ici : un point apparaît à la deuxième validation, puis grossit.
+        Les articles ignorés n'en créent jamais, ils ne font que faire maigrir ceux qui existent.</p>
+        <button class="btn" id="mapGo">Aller trier</button></div>`;
+      $("#mapGo").onclick = () => go("triage");
+    }
+  }
+  layoutMap(nodes);
+  const keep = new Set(nodes.map(n => n.key));
+  $("#gEdges").innerHTML = MODEL.edges.filter(e => keep.has(e.a) && keep.has(e.b)).map(e => {
+    const a = MAP.pos.get(e.a), b = MAP.pos.get(e.b);
+    return `<line class="edge" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" style="stroke-width:${Math.min(4, 1 + e.n / 4)}"/>`;
+  }).join("");
+  $("#gNodes").innerHTML = nodes.map(c => {
+    const p = MAP.pos.get(c.key), r = conceptRadius(c);
+    const label = c.label.length > 24 ? c.label.slice(0, 23) + "…" : c.label;
+    return `<g class="node ${c.w <= -0.12 ? "neg" : c.w < 0.12 ? "weak" : ""} ${MAP.selected === c.key ? "selected" : ""}" data-key="${esc(c.key)}" transform="translate(${p.x},${p.y})">
+      <circle class="halo" r="${r + 6}"/>
+      <circle class="core" r="${r}" fill="${conceptColor(c)}"/>
+      <text class="initial" dy="4.5">${c.pos}</text>
+      <text y="${r + 18}">${esc(label)}</text>
+      <text class="sub" y="${r + 33}">${c.neg ? `${c.neg} écarté${c.neg > 1 ? "s" : ""}` : FEATURE_KINDS[c.kind]}</text>
+    </g>`;
+  }).join("");
+}
+
+/** Fiche d'un concept : ce que le modèle en a appris, et deux façons d'agir dessus. */
+function openConcept(key) {
+  const c = MODEL.byKey.get(key);
+  const box = $("#inspector");
+  if (!c || !box) return;
+  MAP.selected = key;
+  $$("#gNodes .node").forEach(n => n.classList.toggle("selected", n.dataset.key === key));
+  box.hidden = false;
+
+  const arts = c.pmids.map(p => DB.articles.get(p)).filter(Boolean)
+    .sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 6);
+  const w = c.w;
+  const strength = w >= 0.45 ? "signal fort" : w >= 0.12 ? "signal net" : w > -0.12 ? "signal faible" : "signal négatif";
+  const share = Math.min(100, Math.abs(w) / 1.2 * 100);
+  const already = themesList().some(t => t.name.toLowerCase() === c.label.toLowerCase());
+
+  box.innerHTML = `
+    <header>
+      <span style="width:14px;height:14px;border-radius:50%;background:${conceptColor(c)};flex:none"></span>
+      <div style="flex:1;min-width:0"><div style="font-family:var(--font-display);font-size:18px;font-weight:650;overflow:hidden;text-overflow:ellipsis">${esc(c.label)}</div>
+        <span class="hint">${FEATURE_KINDS[c.kind]}</span></div>
+      <button class="icon-btn" id="cClose" title="Fermer" aria-label="Fermer">${icon("x")}</button>
+    </header>
+    <div class="body">
+      <div class="statline">
+        <div><b>${nf(c.pos)}</b><span>gardés</span></div>
+        <div><b>${nf(c.neg)}</b><span>ignorés</span></div>
+        <div><b>${nf(c.dis)}</b><span>« moins de ça »</span></div>
+      </div>
+      <div class="section">
+        <span class="label">Poids dans le modèle</span>
+        <div class="wbar"><i style="width:${share}%;background:${w < 0 ? "var(--ink3)" : conceptColor(c)}"></i></div>
+        <p class="hint" style="margin:6px 0 0">${w >= 0 ? "+" : ""}${nf(w, 2)}, ${strength}. ${MODEL.ready
+          ? "Un article portant ce concept remonte dans le paquet." : "Le modèle n'est pas encore entraîné : ce poids reste à zéro."}</p>
+      </div>
+      <div class="section">
+        <span class="label">Articles gardés</span>
+        ${arts.map(a => `<div class="term"><span title="${esc(a.title)}">${esc(a.title)}</span>
+          <button class="icon-btn" data-pmid="${esc(a.pmid)}" aria-label="Ouvrir">${icon("list")}</button></div>`).join("") || `<p class="hint">Aucun article local.</p>`}
+      </div>
+      <p class="hint">La carte décrit ce que tu gardes, pas ce que l'app cherche. Pour élargir vraiment la veille, transforme un concept en thème de recherche.</p>
+    </div>
+    <footer>
+      <button class="btn" id="cTheme" ${already ? "disabled" : ""}>${icon("plus")}Thème de recherche</button>
+      <button class="btn ghost" id="cSee">${icon("list")}Articles</button>
+      <button class="icon-btn" id="cExcl" style="margin-left:auto;color:var(--red)" title="Exclure ce concept des scans" aria-label="Exclure">${icon("x")}</button>
+    </footer>`;
+
+  $("#cClose").onclick = () => { box.hidden = true; MAP.selected = null; drawInterestMap(); };
+  $$("[data-pmid]", box).forEach(b => b.onclick = () => openArticle(b.dataset.pmid));
+  $("#cSee").onclick = () => { lib.f = { ...DEFAULT_FILTERS(), q: c.label }; lib.limit = 50; go("library"); };
+  $("#cTheme").onclick = () => newThemeModal(null, conceptPreset(c));
+  $("#cExcl").onclick = () => {
+    const pr = conceptPreset(c);
+    saveExclusion({ id: uid(), term: pr.term, field: pr.field, label: c.label, theme: null, enabled: true, del: false });
+    toast(`« ${c.label} » exclu des prochains scans`, { action: { label: "Voir", fn: exclusionsModal } });
+  };
+}
+
+/** Traduction d'un concept en terme PubMed utilisable. */
+function conceptPreset(c) {
+  if (c.kind === "mesh") return { name: c.label, term: c.label, field: "mesh" };
+  if (c.kind === "type") return { name: c.label, term: `"${c.label}"[pt]`, field: "raw" };
+  if (c.kind === "jr") return { name: c.label, term: `"${c.label}"[ta]`, field: "raw" };
+  return { name: c.label, term: c.label, field: "tiab" };
 }
 
 /* =====================================================================
@@ -2677,7 +3246,7 @@ function openArticle(pmid) {
         <div class="section" style="margin-top:18px"><span class="label">Thèmes</span><div class="chips">${themeChips(v.themeIds) || '<span class="hint">Aucun</span>'}</div></div>
         ${a.mesh?.length ? `<div class="section"><span class="label">MeSH</span><div class="chips">${a.mesh.map(m => `<span class="chip">${esc(m)}</span>`).join("")}</div></div>` : ""}
         <div class="section"><span class="label">Score URCV, détail</span>
-          <div class="hint">Preuve ${Math.round(v.comps.evidence * 100)}, citations ${Math.round(v.comps.velocity * 100)}, fraîcheur ${Math.round(v.comps.freshness * 100)}, journal ${Math.round(v.comps.journal * 100)}, priorité du thème ${Math.round(v.comps.theme * 100)} (sur 100 chacun)</div></div>
+          <div class="hint">Preuve ${Math.round(v.comps.evidence * 100)}, citations ${Math.round(v.comps.velocity * 100)}, fraîcheur ${Math.round(v.comps.freshness * 100)}, journal ${Math.round(v.comps.journal * 100)}, priorité du thème ${Math.round(v.comps.theme * 100)}${v.comps.affinity != null ? `, affinité apprise ${Math.round(v.comps.affinity * 100)}` : ""} (sur 100 chacun)</div></div>
         <div class="field"><label for="dNote">Note personnelle</label><textarea class="input" id="dNote" placeholder="Idée pour la visite, lien avec un protocole…">${esc(v.st.n || "")}</textarea></div>
       </div>
     </aside>`;
@@ -2766,7 +3335,7 @@ RENDER.library = function () {
           <div id="rBulk"></div>
           <button class="btn ghost small" id="fOpen" hidden>${icon("filter")}Filtres</button>
           <select class="input" id="rSort" style="width:auto" aria-label="Tri">
-            ${[["score", "Score URCV"], ["date", "Date de publication"], ["added", "Date d'ajout"], ["changed", "Dernier tri"], ["citations", "Citations"], ["velocity", "Tendance"], ["rcr", "RCR"], ["journal", "Impact du journal"]]
+            ${[["score", "Score URCV"], ["date", "Date de publication"], ["added", "Date d'ajout"], ["changed", "Dernier tri"], ["affinity", "Affinité apprise"], ["citations", "Citations"], ["velocity", "Tendance"], ["rcr", "RCR"], ["journal", "Impact du journal"]]
               .map(([v, l]) => `<option value="${v}" ${f.sort === v ? "selected" : ""}>${l}</option>`).join("")}
           </select>
           <button class="icon-btn" id="rOrder" title="${f.order === "desc" ? "Décroissant" : "Croissant"}" style="${f.order === "asc" ? "transform:scaleY(-1)" : ""}">${icon("sort")}</button>
@@ -3043,7 +3612,7 @@ document.addEventListener("touchmove", (e) => { if (kdrag) e.preventDefault(); }
 RENDER.settings = function () {
   const s = DB.settings, sec = secrets();
   const root = $("#view-settings");
-  const W = { evidence: "Niveau de preuve", velocity: "Citations", freshness: "Fraîcheur", journal: "Journal", theme: "Priorité du thème" };
+  const W = { evidence: "Niveau de preuve", velocity: "Citations", freshness: "Fraîcheur", journal: "Journal", theme: "Priorité du thème", affinity: "Affinité apprise" };
   root.innerHTML = `
     <div class="settings">
       <div class="group">
@@ -3084,6 +3653,34 @@ RENDER.settings = function () {
         </div>
         <div class="toggle-row"><span>Scan automatique à l'ouverture<br><span class="hint">Tient compte des scans faits sur tes autres appareils</span></span>
           <label class="switch"><input type="checkbox" id="sAuto" ${s.auto_scan_enabled ? "checked" : ""}><span></span></label></div>
+      </div>
+
+      <div class="group">
+        <h3>Sessions de triage</h3>
+        <p>Le triage avance par paquets courts séparés d'une pause, plutôt qu'en pile sans fin. La pause vaut pour tous tes appareils, elle se synchronise comme le reste.</p>
+        <div class="grid2">
+          <div class="field"><label for="sSize">Cartes par session</label><input class="input" id="sSize" type="number" inputmode="numeric" min="5" max="200" value="${s.session_size}"></div>
+          <div class="field"><label for="sCool">Pause entre deux sessions (heures)</label><input class="input" id="sCool" type="number" inputmode="numeric" min="0" max="48" value="${s.session_cooldown_h}"></div>
+          <div class="field"><label for="sPicks">Cartes choisies par le modèle</label><input class="input" id="sPicks" type="number" inputmode="numeric" min="0" max="20" value="${s.session_model_picks}">
+            <span class="hint">Piochées dans toute la bibliothèque selon l'affinité, le reste vient du tri courant.</span></div>
+          <div class="field"><label for="sMin">Décisions avant d'activer le modèle</label><input class="input" id="sMin" type="number" inputmode="numeric" min="20" max="1000" value="${s.model_min_labels}"></div>
+        </div>
+      </div>
+
+      <div class="group">
+        <h3>Modèle d'affinité</h3>
+        <p>Une régression logistique entraînée sur tes swipes, dans ce navigateur. Rien ne sort de l'appareil : elle se reconstruit à l'identique partout, à partir des décisions synchronisées.</p>
+        <div class="statline" style="margin-bottom:14px">
+          <div><b>${nf(MODEL.pos)}</b><span>gardés</span></div>
+          <div><b>${nf(MODEL.neg)}</b><span>écartés</span></div>
+          <div><b>${nf(MODEL.concepts.length)}</b><span>concepts</span></div>
+        </div>
+        <p class="hint" style="margin:-6px 0 12px">${esc(modelStatus())}${MODEL.dis ? `, dont ${plural(MODEL.dis, "« moins de ça »", "« moins de ça »")}` : ""}.
+          ${MODEL.ready ? "L'affinité entre dans le score, son poids se règle plus bas." : "Continue à trier : en dessous du seuil, seule la carte se construit."}</p>
+        <div class="btn-row">
+          <button class="btn ghost" id="sTrain">Réentraîner maintenant</button>
+          <button class="btn ghost" id="sMap">Voir la carte d'intérêts</button>
+        </div>
       </div>
 
       <div class="group">
@@ -3135,6 +3732,8 @@ RENDER.settings = function () {
       email: $("#sEmail").value.trim(),
       lookback_days: +$("#sLook").value || 365, max_per_theme: +$("#sMax").value || 1000,
       metrics_refresh_days: +$("#sRefresh").value || 7, auto_scan_hours: +$("#sHours").value || 20,
+      session_size: Math.max(5, +$("#sSize").value || 20), session_cooldown_h: Math.max(0, +$("#sCool").value || 0),
+      session_model_picks: Math.max(0, +$("#sPicks").value || 0), model_min_labels: Math.max(20, +$("#sMin").value || 60),
       auto_scan_enabled: $("#sAuto").checked,
       context_enabled: $("#sCtxOn").checked, context_query: $("#sCtx").value.trim(),
       weights, half_life_days: +$("#sHalf").value || 180,
@@ -3143,7 +3742,9 @@ RENDER.settings = function () {
     triage.queue = [];
     renderSync();
   };
-  $("#sSave").onclick = () => { saveAll(); toast("Réglages enregistrés"); };
+  $("#sSave").onclick = () => { saveAll(); trainModel(); toast("Réglages enregistrés"); };
+  $("#sTrain").onclick = () => { trainModel(); toast(MODEL.ready ? `Modèle entraîné sur ${plural(MODEL.n, "décision", "décisions")}` : `Encore ${Math.max(20, +DB.settings.model_min_labels || 60) - MODEL.n} décisions avant l'activation`); RENDER.settings(); };
+  $("#sMap").onclick = () => { graph.mode = "interests"; go("graph"); };
   $("#sSyncNow").onclick = async () => { saveAll(); await syncNow(); };
   $("#sExport").onclick = () => {
     const data = { format: "veille-urcv-web/1", exported_at: new Date().toISOString(), ...exportCore(), articles: [...DB.articles.values()] };
@@ -3237,6 +3838,8 @@ function convertPythonExport(d) {
     return;
   }
   navigator.storage?.persist?.();
+  trainModel();
+  triage.baseline = new Set(MODEL.concepts.map(c => c.key));
   refreshStats();
   renderSync();
   go("triage");
